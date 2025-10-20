@@ -44,7 +44,6 @@ import csv
 import json
 import os
 import re
-import random
 import shutil
 import sqlite3
 import sys
@@ -67,14 +66,7 @@ from sql_of_thought_model_graph import SQLOfThoughtGraph
 load_dotenv()
 
 # ------------------------- Reproducibility -------------------------
-def set_global_seed(seed: int) -> None:
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    try:
-        import numpy as np  # type: ignore
-        np.random.seed(seed)
-    except Exception:
-        pass
-    random.seed(seed)
+# Removed explicit seeding to avoid repeated identical query behavior.
 
 # ------------------------- Paths & Downloaders -------------------------
 HERE = Path(__file__).parent
@@ -386,8 +378,6 @@ def main():
                         help="Which pipeline to run: simple (one-shot) or sot (SQL-of-Thought).")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
                         help="OpenAI model name (default: OPENAI_MODEL or gpt-4.1-mini).")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--max_corrections", type=int, default=2,
                         help="[sot only] Max correction attempts (default: 2).")
     parser.add_argument("--taxonomy_file", type=str, default="error_taxonomy.json",
@@ -405,8 +395,7 @@ def main():
     parser.add_argument("--output_dir", type=Path, default=HERE / "outputs", help="Where to write CSV results.")
     args = parser.parse_args()
 
-    # Seed everything for reproducibility
-    set_global_seed(args.seed)
+    # No global seeding by default; allow natural randomness.
 
     # Early key check
     if not os.getenv("OPENAI_API_KEY"):
