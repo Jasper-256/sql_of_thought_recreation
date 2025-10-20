@@ -1,0 +1,51 @@
+{
+    "Syntax": [
+      "sql_syntax_error",
+      "invalid_alias"
+    ],
+    "Schema Link": [
+      "table_missing",
+      "col_missing",
+      "ambiguous_col",
+      "incorrect_foreign_key"
+    ],
+    "Join": [
+      "join_missing",
+      "join_wrong_type",
+      "extra_table",
+      "incorrect_col"
+    ],
+    "Filter": [
+      "where_missing",
+      "condition_wrong_col",
+      "condition_type_mismatch"
+    ],
+    "Aggregation": [
+      "agg_no_groupby",
+      "groupby_missing_col",
+      "having_without_groupby",
+      "having_incorrect",
+      "having_vs_where"
+    ],
+    "Value": [
+      "hardcoded_value",
+      "value_format_wrong"
+    ],
+    "Subquery": [
+      "unused_subquery",
+      "subquery_missing",
+      "subquery_correlation_error"
+    ],
+    "Set Operations": [
+      "union_missing",
+      "intersect_missing",
+      "except_missing"
+    ],
+    "Other Issues": [
+      "order_by_missing",
+      "limit_missing",
+      "duplicate_select",
+      "unsupported_function",
+      "extra_values_selected"
+    ]
+}

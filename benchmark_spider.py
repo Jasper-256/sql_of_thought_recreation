@@ -1,34 +1,37 @@
 """
 benchmark_spider.py
-Benchmark a single-call LangGraph SQL generator on Spider(-Realistic/-SYN).
+Benchmark Text-to-SQL models on Spider(-Realistic/-SYN).
+
+Now supports two modes:
+  - simple : one-shot single LLM call (baseline in sql_model_graph.py)
+  - sot    : SQL-of-Thought multi-agent with guided correction loop (paper)
 
 What it does:
-- Loads Spider-style question/query pairs:
-    * Prefers local Spider files if present (dev.json, tables.json, database/).
-    * Otherwise loads Hugging Face datasets:
-        - xlangai/spider              (train/dev style)
-        - aherntech/spider-realistic  (dev-style)
-        - aherntech/spider-syn        (train/validation)
-- Attempts to download the official Spider zip (includes SQLite DBs) by:
-    * Scraping the Yale Spider page for the Google Drive link, then using gdown.
-    * If that fails, it still runs EM & validity (no execution accuracy).
-- For each example:
-    * Introspects the SQLite DB schema,
-    * Calls the LangGraph model ONCE to get SQL,
-    * Computes:
-        - Exact Match (normalized string equality),
-        - SQL Validity (parses/executes without error),
-        - Execution Accuracy (matches gold execution results), if DBs available.
-- Writes results to CSV and prints a summary.
+- Loads Spider-style question/query pairs from local files or Hugging Face.
+- Introspects SQLite DBs (Spider) to build schemas.
+- Calls the chosen model to generate SQL.
+- Computes:
+    - Exact Match (normalized string equality),
+    - SQL Validity (parses/executes),
+    - Execution Accuracy (rows match gold),
+- Writes a CSV and prints a summary.
 
-Usage:
-    pip install -U langgraph langchain langchain-openai openai datasets tqdm requests gdown
+Usage (examples):
+    # Simple baseline (default model from OPENAI_MODEL or gpt-4.1-mini)
+    python benchmark_spider.py --mode simple --limit 50 --splits spider
+
+    # SQL-of-Thought with correction loop (3 attempts), explicit taxonomy
+    python benchmark_spider.py --mode sot --max_corrections 3 --taxonomy_file error_taxonomy.json
+
+    # Choose a specific model for all agents
+    python benchmark_spider.py --mode sot --model gpt-4.1-mini
+
+    # Hybrid: planning/correction on a stronger model, others default
+    python benchmark_spider.py --mode sot --model gpt-4.1-mini --correction_model gpt-4.1
+
+Requirements:
+    pip install -U langgraph langchain langchain-openai openai datasets tqdm requests gdown python-dotenv
     export OPENAI_API_KEY=sk-...
-    python benchmark_spider.py --limit 50 --splits spider spider-realistic spider-syn
-
-Notes:
-- Default model is gpt-4.1-mini. Override via --model or OPENAI_MODEL env var.
-- Execution Accuracy requires the Spider 'database/' folder present or downloadable.
 """
 
 from __future__ import annotations
@@ -51,10 +54,12 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 from datasets import load_dataset
 from tqdm import tqdm
-
-# local import
-from sql_model_graph import SQLGeneratorGraph, summarize_sqlite_schema, strip_sql_fences
 from dotenv import load_dotenv
+
+# local imports
+from sql_model_graph import SQLGeneratorGraph, summarize_sqlite_schema, strip_sql_fences
+from sql_of_thought_model_graph import SQLOfThoughtGraph
+
 load_dotenv()
 
 # ------------------------- Paths & Downloaders -------------------------
@@ -73,22 +78,16 @@ def ensure_dir(p: Path):
 
 
 def try_parse_google_drive_id_from_yale_page() -> Optional[str]:
-    """
-    Fetch the Yale Spider page and extract the Google Drive file id of the 'Spider Dataset'.
-    """
+    """Fetch the Yale Spider page and extract the Google Drive file id."""
     try:
         html = requests.get(YALE_SPIDER_PAGE, timeout=20).text
-        # Look for drive.google.com link with id= or /file/d/<id>/
         m = re.search(r'https://drive\.google\.com/[^\s"]+', html)
         if not m:
             return None
         url = m.group(0)
-        # Patterns:
-        #   https://drive.google.com/file/d/<ID>/view?usp=sharing
         m1 = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
         if m1:
             return m1.group(1)
-        #   https://drive.google.com/open?id=<ID>  or ?id=
         m2 = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
         if m2:
             return m2.group(1)
@@ -98,10 +97,7 @@ def try_parse_google_drive_id_from_yale_page() -> Optional[str]:
 
 
 def download_spider_zip_to(data_dir: Path) -> Optional[Path]:
-    """
-    Attempt to download the official Spider zip (which includes database/).
-    Returns the path to the extracted root if successful, else None.
-    """
+    """Attempt to download the official Spider zip (which includes database/)."""
     ensure_dir(data_dir)
     file_id = try_parse_google_drive_id_from_yale_page()
     if not file_id:
@@ -133,16 +129,12 @@ def download_spider_zip_to(data_dir: Path) -> Optional[Path]:
         print("[info] Extracting Spider zip...")
         with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(str(data_dir))
-        # data structure typically places files at top-level or a nested folder; try to move if needed
-        # Ensure DB_DIR exists afterwards
-        # Look for a folder that contains 'database' and 'tables.json'
         candidate_root = None
         for root, dirs, files in os.walk(data_dir):
             if "database" in dirs and "tables.json" in files:
                 candidate_root = Path(root)
                 break
         if candidate_root and candidate_root != data_dir:
-            # move contents up
             for item in candidate_root.iterdir():
                 dest = data_dir / item.name
                 if dest.exists():
@@ -178,10 +170,6 @@ def load_examples_from_local_json(path: Path) -> List[Example]:
 
 
 def load_hf_spider(limit: Optional[int] = None) -> List[Example]:
-    """
-    Load Spider from Hugging Face mirror (xlangai/spider). Uses 'train' split
-    (7k examples). If you also have local dev.json, you can run with that too.
-    """
     ds = load_dataset("xlangai/spider", split="train")
     rows = ds if limit is None else ds.select(range(min(int(limit), len(ds))))
     return [Example(db_id=r["db_id"], question=r["question"], gold_sql=r["query"]) for r in rows]
@@ -194,24 +182,19 @@ def load_hf_spider_realistic(limit: Optional[int] = None) -> List[Example]:
 
 
 def load_hf_spider_syn(split: str = "validation", limit: Optional[int] = None) -> List[Example]:
-    # splits: 'train' (7k), 'validation' (~1k)
     ds = load_dataset("aherntech/spider-syn", split=split)
     rows = ds if limit is None else ds.select(range(min(int(limit), len(ds))))
     return [Example(db_id=r["db_id"], question=r["SpiderSynQuestion"], gold_sql=r["query"]) for r in rows]
 
 
 def load_all_examples(splits: List[str], limit: Optional[int]) -> List[Tuple[str, List[Example]]]:
-    """
-    Returns list of (split_name, examples).
-    split_name in {"spider", "spider-realistic", "spider-syn"}
-    """
     out: List[Tuple[str, List[Example]]] = []
     for sp in splits:
         if sp == "spider":
             if DEV_JSON.exists():
                 ex = load_examples_from_local_json(DEV_JSON)
                 if limit:
-                    ex = ex[: limit]
+                    ex = ex[:limit]
             else:
                 ex = load_hf_spider(limit=limit)
             out.append((sp, ex))
@@ -226,9 +209,8 @@ def load_all_examples(splits: List[str], limit: Optional[int]) -> List[Tuple[str
     return out
 
 
-# ------------------------- SQL Execution & Metrics -------------------------
+# ------------------------- Execution Helpers & Metrics -------------------------
 def normalize_sql(s: str) -> str:
-    # trivial normalization for EM (trim, collapse whitespace, lower)
     s = strip_sql_fences(s or "")
     s = s.strip().rstrip(";")
     s = re.sub(r"\s+", " ", s)
@@ -236,29 +218,18 @@ def normalize_sql(s: str) -> str:
 
 
 def rows_to_canonical(rows: List[Tuple]) -> List[Tuple]:
-    """
-    Normalize SQLite rows to a canonical representation:
-    - convert to tuples
-    - convert bytes to str
-    - lower-case text
-    - sort rows for set-like comparison
-    """
     def norm_val(v):
         if isinstance(v, bytes):
             v = v.decode("utf-8", errors="ignore")
         if isinstance(v, str):
             return v.strip().lower()
         return v
-
     canon = [tuple(norm_val(v) for v in row) for row in rows]
     canon.sort()
     return canon
 
 
 def try_exec_sqlite(db_path: Path, sql: str) -> Tuple[bool, Optional[List[Tuple]]]:
-    """
-    Try executing SQL on SQLite; returns (ok, rows_or_none).
-    """
     if not db_path.exists():
         return False, None
     try:
@@ -278,58 +249,70 @@ def benchmark(
     splits: List[str],
     limit: Optional[int],
     out_dir: Path,
+    mode: str = "simple",
+    max_corrections: int = 2,
+    correction_model: Optional[str] = None,
+    taxonomy_file: Optional[str] = "error_taxonomy.json",
 ) -> None:
     ensure_dir(out_dir)
     ensure_dir(DATA_DIR)
 
-    # Try to ensure local Spider assets (for execution)
+    # Ensure DBs for execution accuracy if possible
     if not have_local_spider_assets():
         print("[info] Local Spider dev + database not found. Attempting to download the full dataset (for execution accuracy)...")
         download_spider_zip_to(DATA_DIR)
 
     have_exec = DB_DIR.exists()
 
-    model = SQLGeneratorGraph(model_name=model_name, temperature=0.0)
+    # Initialize model
+    if mode == "simple":
+        model = SQLGeneratorGraph(model_name=model_name, temperature=0.0)
+    elif mode == "sot":
+        model = SQLOfThoughtGraph(
+            model_name=model_name,
+            correction_model_name=correction_model or model_name,
+            temperature=0.0,
+            max_attempts=max_corrections,
+            taxonomy_path=taxonomy_file,
+        )
+    else:
+        raise ValueError(f"Unknown --mode {mode}")
 
     # Load requested splits
     work = load_all_examples(splits=splits, limit=limit)
 
     # CSV output
     ts = time.strftime("%Y%m%d-%H%M%S")
-    out_csv = out_dir / f"results_{model_name.replace(':','_')}_{ts}.csv"
+    out_csv = out_dir / f"results_{mode}_{model_name.replace(':','_')}_{ts}.csv"
 
     total, em_hits, valid_hits, exec_hits = 0, 0, 0, 0
 
     with out_csv.open("w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "split", "idx", "db_id", "question", "gold_sql", "pred_sql",
+            "mode", "split", "idx", "db_id", "question", "gold_sql", "pred_sql",
             "em", "valid_sql", "exec_acc"
         ])
 
         for split_name, examples in work:
-            print(f"[info] Running split: {split_name} (n={len(examples)})")
+            print(f"[info] Running split: {split_name} (n={len(examples)}) mode={mode}")
             for i, ex in enumerate(tqdm(examples, desc=f"{split_name}")):
                 total += 1
                 db_path = DB_DIR / ex.db_id / f"{ex.db_id}.sqlite"
 
-                # If we don't have DBs, we still call model using a schema:
-                if db_path.exists():
-                    schema_text = summarize_sqlite_schema(str(db_path))
-                else:
-                    # fallback schema (very minimal) to give the model SOME context
-                    schema_text = f"(No DB available) Database: {ex.db_id}. Consider typical Spider schemas."
-
-                # Generate SQL (single-call graph)
+                # Generate SQL via selected pipeline
                 try:
-                    pred_sql = model.generate_sql_for_db(ex.question, str(db_path) if db_path.exists() else str(db_path), ex.db_id)
+                    if mode == "simple":
+                        pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id)
+                    else:
+                        # Pass gold_sql so SoT can trigger correction on row mismatch
+                        pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id, gold_sql=ex.gold_sql)
                 except Exception as e:
                     pred_sql = f"-- ERROR: {e}"
 
                 # Metrics
                 gold_norm = normalize_sql(ex.gold_sql)
                 pred_norm = normalize_sql(pred_sql)
-
                 em = int(gold_norm == pred_norm)
                 em_hits += em
 
@@ -342,10 +325,7 @@ def benchmark(
                         ok_gold, gold_rows = try_exec_sqlite(db_path, ex.gold_sql)
                         if ok_gold:
                             exec_ok = int(rows_to_canonical(pred_rows) == rows_to_canonical(gold_rows))
-                    else:
-                        exec_ok = 0
                 else:
-                    # Can't validate without DB
                     valid_ok = 0
                     exec_ok = 0
 
@@ -353,13 +333,14 @@ def benchmark(
                 exec_hits += exec_ok
 
                 writer.writerow([
-                    split_name, i, ex.db_id, ex.question, ex.gold_sql, pred_sql,
+                    mode, split_name, i, ex.db_id, ex.question, ex.gold_sql, pred_sql,
                     em, valid_ok, exec_ok
                 ])
 
     # Summary
     print("\n===== Summary =====")
-    print(f"Model: {model_name}")
+    print(f"Mode: {mode}")
+    print(f"Model: {model_name} (correction_model={correction_model or model_name if mode=='sot' else 'n/a'})")
     print(f"Total examples: {total}")
     print(f"Exact Match: {em_hits}/{total} = {em_hits/total:.3f}")
     if have_exec:
@@ -373,9 +354,18 @@ def benchmark(
 
 # ------------------------- CLI -------------------------
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark a single-call LangGraph SQL generator on Spider(-Realistic/-SYN).")
+    parser = argparse.ArgumentParser(description="Benchmark Text-to-SQL on Spider(-Realistic/-SYN) with simple or SQL-of-Thought models.")
+    parser.add_argument("--mode", type=str, default="simple", choices=["simple", "sot"],
+                        help="Which pipeline to run: simple (one-shot) or sot (SQL-of-Thought).")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                        help="OpenAI model name (default: gpt-4.1-mini)")
+                        help="OpenAI model name for primary agents (default: OPENAI_MODEL or gpt-4.1-mini).")
+    parser.add_argument("--correction_model", type=str, default=None,
+                        help="[sot only] Optional different model for correction plan/SQL agents.")
+    parser.add_argument("--max_corrections", type=int, default=2,
+                        help="[sot only] Max correction attempts (default: 2).")
+    parser.add_argument("--taxonomy_file", type=str, default="error_taxonomy.json",
+                        help="[sot only] Path to taxonomy JSON (default: error_taxonomy.json).")
+
     parser.add_argument("--limit", type=int, default=50, help="Max examples per split (default: 50)")
     parser.add_argument("--splits", nargs="+", default=["spider"],
                         choices=["spider", "spider-realistic", "spider-syn"],
@@ -389,7 +379,16 @@ def main():
         sys.exit(1)
 
     ensure_dir(args.output_dir)
-    benchmark(model_name=args.model, splits=args.splits, limit=args.limit, out_dir=args.output_dir)
+    benchmark(
+        model_name=args.model,
+        splits=args.splits,
+        limit=args.limit,
+        out_dir=args.output_dir,
+        mode=args.mode,
+        max_corrections=args.max_corrections,
+        correction_model=args.correction_model,
+        taxonomy_file=args.taxonomy_file,
+    )
 
 
 if __name__ == "__main__":
