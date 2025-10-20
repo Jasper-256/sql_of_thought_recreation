@@ -35,9 +35,15 @@ from sql_model_graph import summarize_sqlite_schema, strip_sql_fences
 
 
 # ----------------------------- Helpers -----------------------------
-def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0) -> ChatOpenAI:
+def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
     model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    return ChatOpenAI(model=model, temperature=temperature)
+    kwargs = {"model": model, "temperature": temperature}
+    if max_completion_tokens:
+        kwargs["max_completion_tokens"] = max_completion_tokens
+    if reasoning_effort:
+        # Pass explicitly to the client rather than via model_kwargs
+        kwargs["reasoning_effort"] = reasoning_effort
+    return ChatOpenAI(**kwargs)
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
     """Best-effort JSON parser: strip fences & trailing commas."""
@@ -118,8 +124,9 @@ class SoTState(TypedDict, total=False):
     gold_rows: Optional[List[Tuple]]
     taxonomy: Dict[str, Any]
     model_name: str
-    correction_model_name: str
     max_attempts: int
+    max_completion_tokens: Optional[int]
+    reasoning_effort: Optional[str]
 
 
 # ----------------------------- System Prompts -----------------------------
@@ -154,7 +161,7 @@ Follow the correction plan precisely to fix the prior SQL. Produce ONLY the corr
 
 # ----------------------------- Node Functions -----------------------------
 def _schema_link_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     user = f"""DB: {state['db_id']}
 FULL SCHEMA:
 {state['full_schema']}
@@ -167,7 +174,7 @@ Return a compact, cropped schema relevant to the question."""
     return {"cropped_schema": resp.content.strip()}
 
 def _subproblem_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
@@ -182,7 +189,7 @@ Return ONLY JSON with clause-level sketches."""
     return {"subproblems_json": sub}
 
 def _plan_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     sub_json = json.dumps(state.get("subproblems_json", {}), ensure_ascii=False)
     user = f"""DB: {state['db_id']}
 
@@ -201,7 +208,7 @@ Think step-by-step but OUTPUT ONLY a procedural plan starting with 'PLAN:'."""
     return {"plan": plan}
 
 def _sql_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
@@ -262,7 +269,7 @@ def _execute_node(state: SoTState) -> SoTState:
     }
 
 def _correction_plan_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state.get("correction_model_name") or state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     taxonomy = state.get("taxonomy", {})
     tax_str = json.dumps(taxonomy, indent=2, ensure_ascii=False)
 
@@ -288,7 +295,7 @@ Produce ONLY a numbered correction plan beginning with 'CORRECTION_PLAN:' that r
     return {"plan": resp.content.strip()}  # reuse 'plan' slot for the correction plan
 
 def _correction_sql_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state.get("correction_model_name") or state["model_name"])
+    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
     user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
@@ -314,14 +321,14 @@ Return ONLY the corrected SQL; end with a single semicolon."""
 @dataclass
 class SQLOfThoughtGraph:
     model_name: Optional[str] = None
-    correction_model_name: Optional[str] = None
     temperature: float = 0.0
     max_attempts: int = 2
     taxonomy_path: Optional[str] = "error_taxonomy.json"
+    max_completion_tokens: Optional[int] = None
+    reasoning_effort: Optional[str] = None
 
     def __post_init__(self):
         self.model_name = self.model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-        self.correction_model_name = self.correction_model_name or self.model_name
         self.taxonomy = _load_taxonomy(self.taxonomy_path)
 
         workflow = StateGraph(SoTState)
@@ -380,9 +387,10 @@ class SQLOfThoughtGraph:
             "gold_sql": gold_sql,
             "taxonomy": self.taxonomy,
             "model_name": self.model_name,
-            "correction_model_name": self.correction_model_name or self.model_name,
             "max_attempts": int(self.max_attempts),
             "attempt": 0,
+            "max_completion_tokens": self.max_completion_tokens,
+            "reasoning_effort": self.reasoning_effort,
         }
         out: SoTState = self.app.invoke(init)
         return strip_sql_fences(out.get("sql", "")).strip()

@@ -90,12 +90,18 @@ Follow these rules strictly:
 """
 
 
-def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0) -> ChatOpenAI:
+def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
     model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    return ChatOpenAI(model=model, temperature=temperature)
+    kwargs = {"model": model, "temperature": temperature}
+    if max_completion_tokens:
+        kwargs["max_completion_tokens"] = max_completion_tokens
+    if reasoning_effort:
+        # Pass explicitly to the client rather than via model_kwargs
+        kwargs["reasoning_effort"] = reasoning_effort
+    return ChatOpenAI(**kwargs)
 
 
-def llm_node(state: SQLGenState, model_name: Optional[str] = None) -> SQLGenState:
+def llm_node(state: SQLGenState, model_name: Optional[str] = None, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None) -> SQLGenState:
     """
     The single node: call the LLM once with the schema and question.
     """
@@ -103,7 +109,7 @@ def llm_node(state: SQLGenState, model_name: Optional[str] = None) -> SQLGenStat
     schema = state["schema"]
     db_id = state.get("db_id", "unknown_db")
 
-    llm = _make_llm(model_name=model_name)
+    llm = _make_llm(model_name=model_name, max_completion_tokens=max_completion_tokens, reasoning_effort=reasoning_effort)
 
     user = f"""You are writing SQL for database: {db_id}
 
@@ -126,12 +132,14 @@ class SQLGeneratorGraph:
     Minimal wrapper around a 1-node LangGraph that produces SQL strings.
     """
 
-    def __init__(self, model_name: Optional[str] = None, temperature: float = 0.0):
+    def __init__(self, model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None):
         self.model_name = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.temperature = temperature
+        self.max_completion_tokens = max_completion_tokens
+        self.reasoning_effort = reasoning_effort
 
         workflow = StateGraph(SQLGenState)
-        workflow.add_node("generate_sql", lambda s: llm_node(s, model_name=self.model_name))
+        workflow.add_node("generate_sql", lambda s: llm_node(s, model_name=self.model_name, max_completion_tokens=self.max_completion_tokens, reasoning_effort=self.reasoning_effort))
         workflow.add_edge(START, "generate_sql")
         workflow.add_edge("generate_sql", END)
         self.app = workflow.compile()

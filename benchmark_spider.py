@@ -26,8 +26,11 @@ Usage (examples):
     # Choose a specific model for all agents
     python benchmark_spider.py --mode sot --model gpt-4.1-mini
 
-    # Hybrid: planning/correction on a stronger model, others default
-    python benchmark_spider.py --mode sot --model gpt-4.1-mini --correction_model gpt-4.1
+    # Use reasoning model with effort control
+    python benchmark_spider.py --mode sot --model o3-mini --reasoning_effort high
+
+    # Use reasoning model with token limits
+    python benchmark_spider.py --mode simple --model o3-mini --max_completion_tokens 10000
 
 Requirements:
     pip install -U langgraph langchain langchain-openai openai datasets tqdm requests gdown python-dotenv
@@ -41,6 +44,7 @@ import csv
 import json
 import os
 import re
+import random
 import shutil
 import sqlite3
 import sys
@@ -61,6 +65,16 @@ from sql_model_graph import SQLGeneratorGraph, summarize_sqlite_schema, strip_sq
 from sql_of_thought_model_graph import SQLOfThoughtGraph
 
 load_dotenv()
+
+# ------------------------- Reproducibility -------------------------
+def set_global_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    try:
+        import numpy as np  # type: ignore
+        np.random.seed(seed)
+    except Exception:
+        pass
+    random.seed(seed)
 
 # ------------------------- Paths & Downloaders -------------------------
 HERE = Path(__file__).parent
@@ -251,8 +265,9 @@ def benchmark(
     out_dir: Path,
     mode: str = "simple",
     max_corrections: int = 2,
-    correction_model: Optional[str] = None,
     taxonomy_file: Optional[str] = "error_taxonomy.json",
+    max_completion_tokens: Optional[int] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> None:
     ensure_dir(out_dir)
     ensure_dir(DATA_DIR)
@@ -266,14 +281,20 @@ def benchmark(
 
     # Initialize model
     if mode == "simple":
-        model = SQLGeneratorGraph(model_name=model_name, temperature=0.0)
+        model = SQLGeneratorGraph(
+            model_name=model_name,
+            temperature=0.0,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+        )
     elif mode == "sot":
         model = SQLOfThoughtGraph(
             model_name=model_name,
-            correction_model_name=correction_model or model_name,
             temperature=0.0,
             max_attempts=max_corrections,
             taxonomy_path=taxonomy_file,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
         )
     else:
         raise ValueError(f"Unknown --mode {mode}")
@@ -340,7 +361,11 @@ def benchmark(
     # Summary
     print("\n===== Summary =====")
     print(f"Mode: {mode}")
-    print(f"Model: {model_name} (correction_model={correction_model or model_name if mode=='sot' else 'n/a'})")
+    print(f"Model: {model_name}")
+    if max_completion_tokens:
+        print(f"Max completion tokens: {max_completion_tokens}")
+    if reasoning_effort:
+        print(f"Reasoning effort: {reasoning_effort}")
     print(f"Total examples: {total}")
     print(f"Exact Match: {em_hits}/{total} = {em_hits/total:.3f}")
     if have_exec:
@@ -358,13 +383,17 @@ def main():
     parser.add_argument("--mode", type=str, default="simple", choices=["simple", "sot"],
                         help="Which pipeline to run: simple (one-shot) or sot (SQL-of-Thought).")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                        help="OpenAI model name for primary agents (default: OPENAI_MODEL or gpt-4.1-mini).")
-    parser.add_argument("--correction_model", type=str, default=None,
-                        help="[sot only] Optional different model for correction plan/SQL agents.")
+                        help="OpenAI model name (default: OPENAI_MODEL or gpt-4.1-mini).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     parser.add_argument("--max_corrections", type=int, default=2,
                         help="[sot only] Max correction attempts (default: 2).")
     parser.add_argument("--taxonomy_file", type=str, default="error_taxonomy.json",
                         help="[sot only] Path to taxonomy JSON (default: error_taxonomy.json).")
+    parser.add_argument("--max_completion_tokens", type=int, default=None,
+                        help="Max completion tokens for reasoning models (optional).")
+    parser.add_argument("--reasoning_effort", type=str, default=None, choices=["low", "medium", "high"],
+                        help="Reasoning effort for reasoning models: low, medium, or high (optional).")
 
     parser.add_argument("--limit", type=int, default=50, help="Max examples per split (default: 50)")
     parser.add_argument("--splits", nargs="+", default=["spider"],
@@ -372,6 +401,9 @@ def main():
                         help="Which splits to run (default: spider)")
     parser.add_argument("--output_dir", type=Path, default=HERE / "outputs", help="Where to write CSV results.")
     args = parser.parse_args()
+
+    # Seed everything for reproducibility
+    set_global_seed(args.seed)
 
     # Early key check
     if not os.getenv("OPENAI_API_KEY"):
@@ -386,8 +418,9 @@ def main():
         out_dir=args.output_dir,
         mode=args.mode,
         max_corrections=args.max_corrections,
-        correction_model=args.correction_model,
         taxonomy_file=args.taxonomy_file,
+        max_completion_tokens=args.max_completion_tokens,
+        reasoning_effort=args.reasoning_effort,
     )
 
 
