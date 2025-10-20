@@ -35,6 +35,12 @@ from sql_model_graph import summarize_sqlite_schema, strip_sql_fences
 
 
 # ----------------------------- Helpers -----------------------------
+def _vprint(enabled: bool, title: str, content: str) -> None:
+    if not enabled:
+        return
+    print("\n" + "=" * 20 + f" {title} " + "=" * 20)
+    print(content)
+    print("=" * (44 + len(title)))
 def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
     model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
     kwargs = {"model": model, "temperature": temperature}
@@ -127,6 +133,7 @@ class SoTState(TypedDict, total=False):
     max_attempts: int
     max_completion_tokens: Optional[int]
     reasoning_effort: Optional[str]
+    verbose: bool
 
 
 # ----------------------------- System Prompts -----------------------------
@@ -171,6 +178,8 @@ QUESTION:
 
 Return a compact, cropped schema relevant to the question."""
     resp = llm.invoke([SystemMessage(content=SCHEMA_LINK_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "SCHEMA_LINK / INPUT", f"SYSTEM:\n{SCHEMA_LINK_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "SCHEMA_LINK / OUTPUT", resp.content)
     return {"cropped_schema": resp.content.strip()}
 
 def _subproblem_node(state: SoTState) -> SoTState:
@@ -185,7 +194,10 @@ QUESTION:
 
 Return ONLY JSON with clause-level sketches."""
     resp = llm.invoke([SystemMessage(content=SUBPROBLEM_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / INPUT", f"SYSTEM:\n{SUBPROBLEM_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / OUTPUT (raw)", resp.content)
     sub = _safe_json_loads(resp.content)
+    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / OUTPUT (parsed)", json.dumps(sub, indent=2, ensure_ascii=False))
     return {"subproblems_json": sub}
 
 def _plan_node(state: SoTState) -> SoTState:
@@ -204,6 +216,8 @@ QUESTION:
 
 Think step-by-step but OUTPUT ONLY a procedural plan starting with 'PLAN:'."""
     resp = llm.invoke([SystemMessage(content=PLAN_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "PLAN / INPUT", f"SYSTEM:\n{PLAN_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "PLAN / OUTPUT", resp.content)
     plan = resp.content.strip()
     return {"plan": plan}
 
@@ -222,7 +236,10 @@ QUESTION:
 
 Return ONLY the SQL; end with a single semicolon."""
     resp = llm.invoke([SystemMessage(content=SQL_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "SQL / INPUT", f"SYSTEM:\n{SQL_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "SQL / OUTPUT (raw)", resp.content)
     sql = strip_sql_fences(resp.content).strip()
+    _vprint(bool(state.get("verbose", False)), "SQL / OUTPUT (clean)", sql)
     return {"sql": sql}
 
 def _execute_node(state: SoTState) -> SoTState:
@@ -236,6 +253,8 @@ def _execute_node(state: SoTState) -> SoTState:
 
     if not db_path.exists():
         # Without DB, we can't execute or correct meaningfully
+        if state.get("verbose", False):
+            _vprint(True, "EXECUTE", f"DB missing for {db_path}. SQL will not be executed.\nSQL:\n{sql}")
         return {
             "valid_sql": False,
             "rows": [],
@@ -259,6 +278,19 @@ def _execute_node(state: SoTState) -> SoTState:
             else:
                 # If we can't execute gold, we at least keep the candidate result
                 pass
+
+    if state.get("verbose", False):
+        details = [
+            f"ATTEMPT: {attempt}",
+            f"DB PATH: {db_path}",
+            f"SQL:\n{sql}",
+            f"OK: {ok}",
+            f"ERROR: {err}",
+            f"ROWS ({0 if rows is None else len(rows)}): {rows if rows is not None else []}",
+            f"NEEDS_CORRECTION: {needs}",
+            f"ERROR_SIGNAL: {error_signal}",
+        ]
+        _vprint(True, "EXECUTE", "\n\n".join(details))
 
     return {
         "valid_sql": bool(ok),
@@ -292,6 +324,8 @@ ERROR TAXONOMY (codes only; choose the minimal set that applies):
 
 Produce ONLY a numbered correction plan beginning with 'CORRECTION_PLAN:' that references taxonomy codes."""
     resp = llm.invoke([SystemMessage(content=CORRECTION_PLAN_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "CORRECTION_PLAN / INPUT", f"SYSTEM:\n{CORRECTION_PLAN_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "CORRECTION_PLAN / OUTPUT", resp.content)
     return {"plan": resp.content.strip()}  # reuse 'plan' slot for the correction plan
 
 def _correction_sql_node(state: SoTState) -> SoTState:
@@ -312,7 +346,10 @@ PREVIOUS SQL (to fix):
 
 Return ONLY the corrected SQL; end with a single semicolon."""
     resp = llm.invoke([SystemMessage(content=CORRECTION_SQL_SYS), HumanMessage(content=user)])
+    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / INPUT", f"SYSTEM:\n{CORRECTION_SQL_SYS}\n\nUSER:\n{user}")
+    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / OUTPUT (raw)", resp.content)
     sql = strip_sql_fences(resp.content).strip()
+    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / OUTPUT (clean)", sql)
     attempt = int(state.get("attempt", 0)) + 1
     return {"sql": sql, "attempt": attempt}
 
@@ -326,6 +363,7 @@ class SQLOfThoughtGraph:
     taxonomy_path: Optional[str] = "error_taxonomy.json"
     max_completion_tokens: Optional[int] = None
     reasoning_effort: Optional[str] = None
+    verbose: bool = False
 
     def __post_init__(self):
         self.model_name = self.model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
@@ -391,6 +429,7 @@ class SQLOfThoughtGraph:
             "attempt": 0,
             "max_completion_tokens": self.max_completion_tokens,
             "reasoning_effort": self.reasoning_effort,
+            "verbose": bool(self.verbose),
         }
         out: SoTState = self.app.invoke(init)
         return strip_sql_fences(out.get("sql", "")).strip()

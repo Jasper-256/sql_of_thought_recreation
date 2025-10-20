@@ -268,6 +268,7 @@ def benchmark(
     taxonomy_file: Optional[str] = "error_taxonomy.json",
     max_completion_tokens: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
+    verbose: bool = False,
 ) -> None:
     ensure_dir(out_dir)
     ensure_dir(DATA_DIR)
@@ -295,6 +296,7 @@ def benchmark(
             taxonomy_path=taxonomy_file,
             max_completion_tokens=max_completion_tokens,
             reasoning_effort=reasoning_effort,
+            verbose=bool(verbose),
         )
     else:
         raise ValueError(f"Unknown --mode {mode}")
@@ -394,6 +396,7 @@ def main():
                         help="Max completion tokens for reasoning models (optional).")
     parser.add_argument("--reasoning_effort", type=str, default=None, choices=["low", "medium", "high"],
                         help="Reasoning effort for reasoning models: low, medium, or high (optional).")
+    parser.add_argument("--verbose", action="store_true", help="[sot only] Print full inputs/outputs at each SoT stage.")
 
     parser.add_argument("--limit", type=int, default=50, help="Max examples per split (default: 50)")
     parser.add_argument("--splits", nargs="+", default=["spider"],
@@ -421,6 +424,7 @@ def main():
         taxonomy_file=args.taxonomy_file,
         max_completion_tokens=args.max_completion_tokens,
         reasoning_effort=args.reasoning_effort,
+        verbose=bool(args.verbose),
     )
 
 
