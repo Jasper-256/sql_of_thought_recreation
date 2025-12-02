@@ -12,6 +12,7 @@ from typing import TypedDict, Optional
 
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
+from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 
 
@@ -90,8 +91,25 @@ Follow these rules strictly:
 """
 
 
-def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None) -> ChatOpenAI:
+def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None):
+    """Create an LLM instance. Supports OpenAI and Anthropic models.
+    
+    Use 'anth:' prefix for Anthropic models (e.g., 'anth:claude-sonnet-4-5').
+    """
     model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    
+    # Check for Anthropic prefix
+    if model.startswith("anth:"):
+        anthropic_model = model[5:]  # Strip 'anth:' prefix
+        kwargs = {"model": anthropic_model, "temperature": temperature}
+        if max_completion_tokens:
+            kwargs["max_tokens"] = max_completion_tokens
+        else:
+            kwargs["max_tokens"] = 4096  # Anthropic requires max_tokens
+        # Note: reasoning_effort is OpenAI-specific, ignored for Anthropic
+        return ChatAnthropic(**kwargs)
+    
+    # Default to OpenAI
     kwargs = {"model": model, "temperature": temperature}
     if max_completion_tokens:
         kwargs["max_completion_tokens"] = max_completion_tokens

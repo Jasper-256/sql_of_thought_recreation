@@ -4,9 +4,13 @@
 langgraph>=0.2.0
 langchain>=0.3.0
 langchain-openai>=0.2.0
+langchain-anthropic>=0.3.0
 
 # OpenAI API client
 openai>=1.40.0
+
+# Anthropic API client
+anthropic>=0.40.0
 
 # Hugging Face datasets for Spider benchmark
 datasets>=2.14.0

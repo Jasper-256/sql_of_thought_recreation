@@ -26,6 +26,9 @@ Usage (examples):
     # Choose a specific model for all agents
     python benchmark_spider.py --mode sot --model gpt-4.1-mini
 
+    # Use Anthropic model (requires ANTHROPIC_API_KEY in .env)
+    python benchmark_spider.py --mode sot --model anth:claude-sonnet-4-5
+
     # Use reasoning model with effort control
     python benchmark_spider.py --mode sot --model o3-mini --reasoning_effort high
 
@@ -445,7 +448,7 @@ def main():
     parser.add_argument("--mode", type=str, default="simple", choices=["simple", "sot"],
                         help="Which pipeline to run: simple (one-shot) or sot (SQL-of-Thought).")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                        help="OpenAI model name (default: OPENAI_MODEL or gpt-4.1-mini).")
+                        help="Model name (default: OPENAI_MODEL or gpt-4.1-mini). Use 'anth:' prefix for Anthropic models (e.g., anth:claude-sonnet-4-5).")
     parser.add_argument("--max_corrections", type=int, default=2,
                         help="[sot only] Max correction attempts (default: 2).")
     parser.add_argument("--taxonomy_file", type=str, default="error_taxonomy.json",
@@ -467,10 +470,17 @@ def main():
 
     # No global seeding by default; allow natural randomness.
 
-    # Early key check
-    if not os.getenv("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY environment variable is not set.")
-        sys.exit(1)
+    # Early key check based on model provider
+    is_anthropic = args.model.startswith("anth:")
+    if is_anthropic:
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            print("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
+            print("       Required for Anthropic models (anth:* prefix).")
+            sys.exit(1)
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            print("ERROR: OPENAI_API_KEY environment variable is not set.")
+            sys.exit(1)
 
     ensure_dir(args.output_dir)
     benchmark(
