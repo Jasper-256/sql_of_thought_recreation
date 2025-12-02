@@ -17,8 +17,12 @@ The key innovation is the **taxonomy-guided correction loop** that goes beyond s
 ## Quick Start
 
 ```bash
+# Create and activate virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
 # Install dependencies
-pip install -U langgraph langchain langchain-openai openai datasets tqdm requests gdown python-dotenv
+pip install -r requirements.txt
 
 # Set your API key
 export OPENAI_API_KEY=sk-...
@@ -55,6 +59,16 @@ python3 benchmark_spider.py \
   --limit 50 \                      # Examples per split
   --splits spider spider-realistic  # Which benchmarks to run
 ```
+
+## Web GUI
+
+A real-time web interface for visualizing the SQL-of-Thought agent pipeline execution. View all LLM inputs and outputs at each step.
+
+```bash
+python3 benchmark_ui.py --port 8080
+```
+
+Then open http://localhost:8080 in your browser.
 
 ## Architecture
 
