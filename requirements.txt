@@ -1,0 +1,23 @@
+# SQL-of-Thought Benchmark and UI Dependencies
+
+# LangChain & LangGraph for agent orchestration
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-openai>=0.2.0
+
+# OpenAI API client
+openai>=1.40.0
+
+# Hugging Face datasets for Spider benchmark
+datasets>=2.14.0
+
+# UI Framework - NiceGUI for live visualization
+nicegui>=2.0.0
+
+# Utilities
+tqdm>=4.66.0
+requests>=2.31.0
+gdown>=5.0.0
+python-dotenv>=1.0.0
+
+
