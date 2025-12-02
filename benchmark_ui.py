@@ -131,7 +131,7 @@ def create_control_panel(on_run, on_stop):
             with ui.column().classes('gap-1'):
                 ui.label('Model').classes('text-xs text-gray-400')
                 model_select = ui.select(
-                    options=['gpt-4.1-mini', 'gpt-4o-2024-08-06', 'gpt-4o-mini', 'o3-mini'],
+                    options=['gpt-4.1-mini', 'gpt-5.1-2025-11-13', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07'],
                     value=state.model_name
                 ).classes('w-48').props('dark dense outlined')
                 model_select.bind_value(state, 'model_name')

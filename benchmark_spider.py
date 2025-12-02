@@ -43,6 +43,7 @@ import argparse
 import csv
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -193,22 +194,30 @@ def load_hf_spider_syn(split: str = "validation", limit: Optional[int] = None) -
     return [Example(db_id=r["db_id"], question=r["SpiderSynQuestion"], gold_sql=r["query"]) for r in rows]
 
 
-def load_all_examples(splits: List[str], limit: Optional[int]) -> List[Tuple[str, List[Example]]]:
+def load_all_examples(splits: List[str], limit: Optional[int], shuffle: bool = True) -> List[Tuple[str, List[Example]]]:
     out: List[Tuple[str, List[Example]]] = []
     for sp in splits:
         if sp == "spider":
             if DEV_JSON.exists():
                 ex = load_examples_from_local_json(DEV_JSON)
+                if shuffle:
+                    random.shuffle(ex)
                 if limit:
                     ex = ex[:limit]
             else:
                 ex = load_hf_spider(limit=limit)
+                if shuffle:
+                    random.shuffle(ex)
             out.append((sp, ex))
         elif sp == "spider-realistic":
             ex = load_hf_spider_realistic(limit=limit)
+            if shuffle:
+                random.shuffle(ex)
             out.append((sp, ex))
         elif sp == "spider-syn":
             ex = load_hf_spider_syn(split="validation", limit=limit)
+            if shuffle:
+                random.shuffle(ex)
             out.append((sp, ex))
         else:
             print(f"[warn] Unknown split: {sp} (skipped)")
