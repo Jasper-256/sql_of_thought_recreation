@@ -1,20 +1,8 @@
 """
-sql_of_thought_model_graph.py
+sql_of_thought_with_callbacks.py
 
-A LangGraph implementation of SQL-of-Thought (SoT) as described in:
-- "SQL-of-Thought: Multi-agentic Text-to-SQL with Guided Error Correction"
-  (architecture figure on p.2; error taxonomy on p.5).  See paper for details.
-
-Pipeline (single pass + guided correction loop):
-    SchemaLink -> Subproblem -> QueryPlan(CoT) -> SQL -> Execute
-      -> [if needed] CorrectionPlan(CoT + taxonomy) -> CorrectionSQL -> Execute ...
-      (repeat until success or max_attempts)
-
-Notes:
-- Uses the helper utilities from sql_model_graph.py (summarize_sqlite_schema, strip_sql_fences).
-- If `gold_sql` is provided and the DB is available, we compare execution results
-  of candidate vs gold and trigger correction on mismatch (not just on exceptions).
-- If the DB is missing, we still run the agentic pipeline but skip execution/correction.
+A modified version of the SQL-of-Thought model graph that supports 
+callbacks for each step, enabling live UI updates.
 """
 
 from __future__ import annotations
@@ -22,65 +10,46 @@ import json
 import os
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 from langchain_openai import ChatOpenAI
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 
-# Reuse helpers from the simple model
 from sql_model_graph import summarize_sqlite_schema, strip_sql_fences
 
 
+# ----------------------------- Callback Type -----------------------------
+StepCallback = Callable[[str, str, str, str, Optional[Dict[str, Any]]], None]
+# (step_name, system_prompt, user_prompt, output, extra_info)
+
+
 # ----------------------------- Helpers -----------------------------
-def _vprint(enabled: bool, title: str, content: str) -> None:
-    if not enabled:
-        return
-    print("\n" + "=" * 20 + f" {title} " + "=" * 20)
-    print(content)
-    print("=" * (44 + len(title)))
-def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, max_completion_tokens: Optional[int] = None, reasoning_effort: Optional[str] = None):
-    """Create an LLM instance. Supports OpenAI and Anthropic models.
-    
-    Use 'anth:' prefix for Anthropic models (e.g., 'anth:claude-sonnet-4-5').
-    """
+def _make_llm(model_name: Optional[str] = None, temperature: float = 0.0, 
+              max_completion_tokens: Optional[int] = None, 
+              reasoning_effort: Optional[str] = None) -> ChatOpenAI:
     model = model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    
-    # Check for Anthropic prefix
-    if model.startswith("anth:"):
-        anthropic_model = model[5:]  # Strip 'anth:' prefix
-        kwargs = {"model": anthropic_model, "temperature": temperature}
-        if max_completion_tokens:
-            kwargs["max_tokens"] = max_completion_tokens
-        else:
-            kwargs["max_tokens"] = 4096  # Anthropic requires max_tokens
-        # Note: reasoning_effort is OpenAI-specific, ignored for Anthropic
-        return ChatAnthropic(**kwargs)
-    
-    # Default to OpenAI
     kwargs = {"model": model, "temperature": temperature}
     if max_completion_tokens:
         kwargs["max_completion_tokens"] = max_completion_tokens
     if reasoning_effort:
-        # Pass explicitly to the client rather than via model_kwargs
         kwargs["reasoning_effort"] = reasoning_effort
     return ChatOpenAI(**kwargs)
+
 
 def _safe_json_loads(text: str) -> Dict[str, Any]:
     """Best-effort JSON parser: strip fences & trailing commas."""
     if not text:
         return {}
-    # strip code fences if present
     t = re.sub(r"```json\s*|\s*```", "", text, flags=re.IGNORECASE).strip()
-    # remove trailing commas before } or ]
     t = re.sub(r",(\s*[\]\}])", r"\1", t)
     try:
         return json.loads(t)
     except Exception:
         return {}
+
 
 def _rows_to_canonical(rows: List[Tuple]) -> List[Tuple]:
     """Normalize SQLite rows for set-like comparison."""
@@ -93,6 +62,7 @@ def _rows_to_canonical(rows: List[Tuple]) -> List[Tuple]:
     canon = [tuple(norm_val(v) for v in row) for row in rows]
     canon.sort()
     return canon
+
 
 def _exec_sql(db_path: Path, sql: str) -> Tuple[bool, Optional[List[Tuple]], Optional[str]]:
     """Execute SQL. Returns (ok, rows_or_none, error_message_or_none)."""
@@ -108,8 +78,8 @@ def _exec_sql(db_path: Path, sql: str) -> Tuple[bool, Optional[List[Tuple]], Opt
     except Exception as e:
         return False, None, str(e)
 
+
 def _load_taxonomy(taxonomy_path: Optional[str]) -> Dict[str, Any]:
-    # Default taxonomy mirrors the paper's p.5 figure (9 categories / 31 subtypes)
     default_taxonomy = {
         "Syntax": ["sql_syntax_error", "invalid_alias"],
         "Schema Link": ["table_missing", "col_missing", "ambiguous_col", "incorrect_foreign_key"],
@@ -152,6 +122,8 @@ class SoTState(TypedDict, total=False):
     max_completion_tokens: Optional[int]
     reasoning_effort: Optional[str]
     verbose: bool
+    # Callback storage (not used in graph directly, passed through)
+    step_callback: Optional[Any]
 
 
 # ----------------------------- System Prompts -----------------------------
@@ -237,10 +209,21 @@ Write ONLY the final valid SQL query for SQLite. Do NOT include commentary or un
 """
 
 
-# ----------------------------- Node Functions -----------------------------
-def _schema_link_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    user = f"""DB: {state['db_id']}
+# ----------------------------- Node Factory -----------------------------
+def create_nodes(callback: Optional[StepCallback] = None):
+    """Create node functions with callback support."""
+    
+    def _notify(step_name: str, sys_prompt: str, user_prompt: str, output: str, extra: Optional[Dict] = None):
+        if callback:
+            callback(step_name, sys_prompt, user_prompt, output, extra)
+    
+    def schema_link_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        user = f"""DB: {state['db_id']}
 FULL SCHEMA:
 {state['full_schema']}
 
@@ -248,14 +231,20 @@ QUESTION:
 {state['question']}
 
 Return only the relevant tables and columns in the specified format."""
-    resp = llm.invoke([SystemMessage(content=SCHEMA_LINK_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "SCHEMA_LINK / INPUT", f"SYSTEM:\n{SCHEMA_LINK_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "SCHEMA_LINK / OUTPUT", resp.content)
-    return {"cropped_schema": resp.content.strip()}
+        
+        resp = llm.invoke([SystemMessage(content=SCHEMA_LINK_SYS), HumanMessage(content=user)])
+        output = resp.content.strip()
+        
+        _notify("schema_link", SCHEMA_LINK_SYS, user, output, {"db_id": state["db_id"]})
+        return {"cropped_schema": output}
 
-def _subproblem_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    user = f"""DB: {state['db_id']}
+    def subproblem_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
 {state['cropped_schema']}
@@ -264,17 +253,22 @@ QUESTION:
 {state['question']}
 
 Return ONLY valid JSON as specified."""
-    resp = llm.invoke([SystemMessage(content=SUBPROBLEM_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / INPUT", f"SYSTEM:\n{SUBPROBLEM_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / OUTPUT (raw)", resp.content)
-    sub = _safe_json_loads(resp.content)
-    _vprint(bool(state.get("verbose", False)), "SUBPROBLEM / OUTPUT (parsed)", json.dumps(sub, indent=2, ensure_ascii=False))
-    return {"subproblems_json": sub}
+        
+        resp = llm.invoke([SystemMessage(content=SUBPROBLEM_SYS), HumanMessage(content=user)])
+        raw_output = resp.content
+        sub = _safe_json_loads(raw_output)
+        
+        _notify("subproblem", SUBPROBLEM_SYS, user, raw_output, {"parsed_json": sub})
+        return {"subproblems_json": sub}
 
-def _plan_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    sub_json = json.dumps(state.get("subproblems_json", {}), ensure_ascii=False)
-    user = f"""DB: {state['db_id']}
+    def plan_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        sub_json = json.dumps(state.get("subproblems_json", {}), ensure_ascii=False)
+        user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
 {state['cropped_schema']}
@@ -286,15 +280,20 @@ QUESTION:
 {state['question']}
 
 Think step-by-step but OUTPUT ONLY a numbered procedural plan (no SQL)."""
-    resp = llm.invoke([SystemMessage(content=PLAN_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "PLAN / INPUT", f"SYSTEM:\n{PLAN_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "PLAN / OUTPUT", resp.content)
-    plan = resp.content.strip()
-    return {"plan": plan}
+        
+        resp = llm.invoke([SystemMessage(content=PLAN_SYS), HumanMessage(content=user)])
+        plan = resp.content.strip()
+        
+        _notify("plan", PLAN_SYS, user, plan)
+        return {"plan": plan}
 
-def _sql_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    user = f"""DB: {state['db_id']}
+    def sql_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        user = f"""DB: {state['db_id']}
 
 FULL SCHEMA (reference):
 {state['full_schema']}
@@ -309,77 +308,78 @@ QUESTION:
 {state['question']}
 
 Return ONLY the final valid SQL query (no commentary). Prefer keys/joins from CROPPED SCHEMA; if absent there, use FK/PK details from FULL SCHEMA."""
-    resp = llm.invoke([SystemMessage(content=SQL_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "SQL / INPUT", f"SYSTEM:\n{SQL_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "SQL / OUTPUT (raw)", resp.content)
-    sql = strip_sql_fences(resp.content).strip()
-    _vprint(bool(state.get("verbose", False)), "SQL / OUTPUT (clean)", sql)
-    return {"sql": sql}
+        
+        resp = llm.invoke([SystemMessage(content=SQL_SYS), HumanMessage(content=user)])
+        raw_output = resp.content
+        sql = strip_sql_fences(raw_output).strip()
+        
+        _notify("sql", SQL_SYS, user, raw_output, {"cleaned_sql": sql})
+        return {"sql": sql}
 
-def _execute_node(state: SoTState) -> SoTState:
-    """Execute the SQL; set needs_correction if exception OR (gold provided and rows mismatch)."""
-    db_path = Path(state["db_path"])
-    sql = state.get("sql", "")
-    attempt = int(state.get("attempt", 0))
-    ok, rows, err = _exec_sql(db_path, sql)
-    needs = False
-    error_signal = ""
+    def execute_node(state: SoTState) -> SoTState:
+        """Execute the SQL; set needs_correction if exception OR (gold provided and rows mismatch)."""
+        db_path = Path(state["db_path"])
+        sql = state.get("sql", "")
+        attempt = int(state.get("attempt", 0))
+        ok, rows, err = _exec_sql(db_path, sql)
+        needs = False
+        error_signal = ""
 
-    if not db_path.exists():
-        # Without DB, we can't execute or correct meaningfully
-        if state.get("verbose", False):
-            _vprint(True, "EXECUTE", f"DB missing for {db_path}. SQL will not be executed.\nSQL:\n{sql}")
+        if not db_path.exists():
+            _notify("execute", "", f"DB: {db_path}", "DB missing - cannot execute", {
+                "attempt": attempt,
+                "db_exists": False,
+                "sql": sql,
+            })
+            return {
+                "valid_sql": False,
+                "rows": [],
+                "needs_correction": False,
+                "error_signal": "db_missing",
+                "attempt": attempt
+            }
+
+        if not ok:
+            needs = True
+            error_signal = f"exception: {err or 'unknown'}"
+        else:
+            gold_sql = state.get("gold_sql")
+            if gold_sql:
+                gok, grows, gerr = _exec_sql(db_path, gold_sql)
+                if gok and grows is not None and rows is not None:
+                    if _rows_to_canonical(rows) != _rows_to_canonical(grows):
+                        needs = True
+                        error_signal = "result_mismatch"
+
+        _notify("execute", "", f"SQL:\n{sql}", 
+                f"OK: {ok}\nError: {err}\nRows: {len(rows) if rows else 0}\nNeeds correction: {needs}", {
+            "attempt": attempt,
+            "ok": ok,
+            "error": err,
+            "rows": rows[:10] if rows else [],  # Limit rows for UI
+            "row_count": len(rows) if rows else 0,
+            "needs_correction": needs,
+            "error_signal": error_signal,
+        })
+
         return {
-            "valid_sql": False,
-            "rows": [],
-            "needs_correction": False,
-            "error_signal": "db_missing",
+            "valid_sql": bool(ok),
+            "rows": rows or [],
+            "needs_correction": needs,
+            "error_signal": error_signal,
             "attempt": attempt
         }
 
-    if not ok:
-        needs = True
-        error_signal = f"exception: {err or 'unknown'}"
-    else:
-        # If we have a gold reference and it executes, compare results
-        gold_sql = state.get("gold_sql")
-        if gold_sql:
-            gok, grows, gerr = _exec_sql(db_path, gold_sql)
-            if gok and grows is not None and rows is not None:
-                if _rows_to_canonical(rows) != _rows_to_canonical(grows):
-                    needs = True
-                    error_signal = "result_mismatch"  # logical error despite valid SQL
-            else:
-                # If we can't execute gold, we at least keep the candidate result
-                pass
+    def correction_plan_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        taxonomy = state.get("taxonomy", {})
+        tax_str = json.dumps(taxonomy, indent=2, ensure_ascii=False)
 
-    if state.get("verbose", False):
-        details = [
-            f"ATTEMPT: {attempt}",
-            f"DB PATH: {db_path}",
-            f"SQL:\n{sql}",
-            f"OK: {ok}",
-            f"ERROR: {err}",
-            f"ROWS ({0 if rows is None else len(rows)}): {rows if rows is not None else []}",
-            f"NEEDS_CORRECTION: {needs}",
-            f"ERROR_SIGNAL: {error_signal}",
-        ]
-        _vprint(True, "EXECUTE", "\n\n".join(details))
-
-    return {
-        "valid_sql": bool(ok),
-        "rows": rows or [],
-        "needs_correction": needs,
-        "error_signal": error_signal,
-        "attempt": attempt
-    }
-
-def _correction_plan_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    taxonomy = state.get("taxonomy", {})
-    tax_str = json.dumps(taxonomy, indent=2, ensure_ascii=False)
-
-    user = f"""DB: {state['db_id']}
+        user = f"""DB: {state['db_id']}
 
 CROPPED SCHEMA:
 {state['cropped_schema']}
@@ -397,14 +397,20 @@ ERROR TAXONOMY (reference only):
 {tax_str}
 
 Return ONLY a concise, numbered natural-language correction plan. Do not generate SQL."""
-    resp = llm.invoke([SystemMessage(content=CORRECTION_PLAN_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "CORRECTION_PLAN / INPUT", f"SYSTEM:\n{CORRECTION_PLAN_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "CORRECTION_PLAN / OUTPUT", resp.content)
-    return {"plan": resp.content.strip()}  # reuse 'plan' slot for the correction plan
+        
+        resp = llm.invoke([SystemMessage(content=CORRECTION_PLAN_SYS), HumanMessage(content=user)])
+        plan = resp.content.strip()
+        
+        _notify("correction_plan", CORRECTION_PLAN_SYS, user, plan, {"error_signal": state.get("error_signal", "")})
+        return {"plan": plan}
 
-def _correction_sql_node(state: SoTState) -> SoTState:
-    llm = _make_llm(model_name=state["model_name"], max_completion_tokens=state.get("max_completion_tokens"), reasoning_effort=state.get("reasoning_effort"))
-    user = f"""DB: {state['db_id']}
+    def correction_sql_node(state: SoTState) -> SoTState:
+        llm = _make_llm(
+            model_name=state["model_name"], 
+            max_completion_tokens=state.get("max_completion_tokens"), 
+            reasoning_effort=state.get("reasoning_effort")
+        )
+        user = f"""DB: {state['db_id']}
 
 FULL SCHEMA (reference):
 {state['full_schema']}
@@ -422,18 +428,32 @@ PREVIOUS SQL (to fix):
 {state['sql']}
 
 Return ONLY the corrected SQL query (no commentary). Prefer keys/joins from CROPPED SCHEMA; if absent there, use FK/PK details from FULL SCHEMA."""
-    resp = llm.invoke([SystemMessage(content=CORRECTION_SQL_SYS), HumanMessage(content=user)])
-    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / INPUT", f"SYSTEM:\n{CORRECTION_SQL_SYS}\n\nUSER:\n{user}")
-    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / OUTPUT (raw)", resp.content)
-    sql = strip_sql_fences(resp.content).strip()
-    _vprint(bool(state.get("verbose", False)), "CORRECTION_SQL / OUTPUT (clean)", sql)
-    attempt = int(state.get("attempt", 0)) + 1
-    return {"sql": sql, "attempt": attempt}
+        
+        resp = llm.invoke([SystemMessage(content=CORRECTION_SQL_SYS), HumanMessage(content=user)])
+        raw_output = resp.content
+        sql = strip_sql_fences(raw_output).strip()
+        attempt = int(state.get("attempt", 0)) + 1
+        
+        _notify("correction_sql", CORRECTION_SQL_SYS, user, raw_output, {
+            "cleaned_sql": sql,
+            "attempt": attempt,
+        })
+        return {"sql": sql, "attempt": attempt}
+    
+    return {
+        "schema_link": schema_link_node,
+        "subproblem": subproblem_node,
+        "plan": plan_node,
+        "sql": sql_node,
+        "execute": execute_node,
+        "correction_plan": correction_plan_node,
+        "correction_sql": correction_sql_node,
+    }
 
 
 # ----------------------------- Public Wrapper -----------------------------
 @dataclass
-class SQLOfThoughtGraph:
+class SQLOfThoughtGraphWithCallbacks:
     model_name: Optional[str] = None
     temperature: float = 0.0
     max_attempts: int = 2
@@ -441,21 +461,29 @@ class SQLOfThoughtGraph:
     max_completion_tokens: Optional[int] = None
     reasoning_effort: Optional[str] = None
     verbose: bool = False
+    step_callback: Optional[StepCallback] = None
+    app: Any = field(default=None, init=False)
+    taxonomy: Dict[str, Any] = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         self.model_name = self.model_name or os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         self.taxonomy = _load_taxonomy(self.taxonomy_path)
+        self._build_graph()
 
+    def _build_graph(self):
+        """Build the LangGraph workflow."""
+        nodes = create_nodes(callback=self.step_callback)
+        
         workflow = StateGraph(SoTState)
-
-        # Nodes
-        workflow.add_node("schema_link", _schema_link_node)
-        workflow.add_node("subproblem", _subproblem_node)
-        workflow.add_node("plan", _plan_node)
-        workflow.add_node("sql", _sql_node)
-        workflow.add_node("execute", _execute_node)
-        workflow.add_node("correction_plan", _correction_plan_node)
-        workflow.add_node("correction_sql", _correction_sql_node)
+        
+        # Add nodes
+        workflow.add_node("schema_link", nodes["schema_link"])
+        workflow.add_node("subproblem", nodes["subproblem"])
+        workflow.add_node("plan", nodes["plan"])
+        workflow.add_node("sql", nodes["sql"])
+        workflow.add_node("execute", nodes["execute"])
+        workflow.add_node("correction_plan", nodes["correction_plan"])
+        workflow.add_node("correction_sql", nodes["correction_sql"])
 
         # Linear prefix
         workflow.add_edge(START, "schema_link")
@@ -486,6 +514,11 @@ class SQLOfThoughtGraph:
 
         self.app = workflow.compile()
 
+    def set_callback(self, callback: StepCallback):
+        """Update the callback and rebuild the graph."""
+        self.step_callback = callback
+        self._build_graph()
+
     def generate_sql_for_db(
         self,
         question: str,
@@ -510,3 +543,5 @@ class SQLOfThoughtGraph:
         }
         out: SoTState = self.app.invoke(init)
         return strip_sql_fences(out.get("sql", "")).strip()
+
+

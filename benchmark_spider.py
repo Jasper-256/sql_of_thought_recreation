@@ -26,6 +26,9 @@ Usage (examples):
     # Choose a specific model for all agents
     python benchmark_spider.py --mode sot --model gpt-4.1-mini
 
+    # Use Anthropic model (requires ANTHROPIC_API_KEY in .env)
+    python benchmark_spider.py --mode sot --model anth:claude-sonnet-4-5
+
     # Use reasoning model with effort control
     python benchmark_spider.py --mode sot --model o3-mini --reasoning_effort high
 
@@ -43,14 +46,16 @@ import argparse
 import csv
 import json
 import os
-import re
 import random
+import re
 import shutil
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -67,14 +72,7 @@ from sql_of_thought_model_graph import SQLOfThoughtGraph
 load_dotenv()
 
 # ------------------------- Reproducibility -------------------------
-def set_global_seed(seed: int) -> None:
-    os.environ["PYTHONHASHSEED"] = str(seed)
-    try:
-        import numpy as np  # type: ignore
-        np.random.seed(seed)
-    except Exception:
-        pass
-    random.seed(seed)
+# Removed explicit seeding to avoid repeated identical query behavior.
 
 # ------------------------- Paths & Downloaders -------------------------
 HERE = Path(__file__).parent
@@ -201,22 +199,30 @@ def load_hf_spider_syn(split: str = "validation", limit: Optional[int] = None) -
     return [Example(db_id=r["db_id"], question=r["SpiderSynQuestion"], gold_sql=r["query"]) for r in rows]
 
 
-def load_all_examples(splits: List[str], limit: Optional[int]) -> List[Tuple[str, List[Example]]]:
+def load_all_examples(splits: List[str], limit: Optional[int], shuffle: bool = True) -> List[Tuple[str, List[Example]]]:
     out: List[Tuple[str, List[Example]]] = []
     for sp in splits:
         if sp == "spider":
             if DEV_JSON.exists():
                 ex = load_examples_from_local_json(DEV_JSON)
+                if shuffle:
+                    random.shuffle(ex)
                 if limit:
                     ex = ex[:limit]
             else:
                 ex = load_hf_spider(limit=limit)
+                if shuffle:
+                    random.shuffle(ex)
             out.append((sp, ex))
         elif sp == "spider-realistic":
             ex = load_hf_spider_realistic(limit=limit)
+            if shuffle:
+                random.shuffle(ex)
             out.append((sp, ex))
         elif sp == "spider-syn":
             ex = load_hf_spider_syn(split="validation", limit=limit)
+            if shuffle:
+                random.shuffle(ex)
             out.append((sp, ex))
         else:
             print(f"[warn] Unknown split: {sp} (skipped)")
@@ -258,6 +264,69 @@ def try_exec_sqlite(db_path: Path, sql: str) -> Tuple[bool, Optional[List[Tuple]
 
 
 # ------------------------- Benchmark -------------------------
+def _create_model(mode: str, model_name: str, max_corrections: int, taxonomy_file: Optional[str],
+                  max_completion_tokens: Optional[int], reasoning_effort: Optional[str], verbose: bool):
+    """Factory function to create a model instance."""
+    if mode == "simple":
+        return SQLGeneratorGraph(
+            model_name=model_name,
+            temperature=0.0,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+    elif mode == "sot":
+        return SQLOfThoughtGraph(
+            model_name=model_name,
+            temperature=0.0,
+            max_attempts=max_corrections,
+            taxonomy_path=taxonomy_file,
+            max_completion_tokens=max_completion_tokens,
+            reasoning_effort=reasoning_effort,
+            verbose=bool(verbose),
+        )
+    else:
+        raise ValueError(f"Unknown --mode {mode}")
+
+
+def _process_example(
+    ex: Example,
+    idx: int,
+    split_name: str,
+    mode: str,
+    model,
+) -> Tuple[int, str, int, int, int, List]:
+    """Process a single example and return metrics. Returns (idx, pred_sql, em, valid_ok, exec_ok, row_data)."""
+    db_path = DB_DIR / ex.db_id / f"{ex.db_id}.sqlite"
+
+    # Generate SQL via selected pipeline
+    try:
+        if mode == "simple":
+            pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id)
+        else:
+            # Pass gold_sql so SoT can trigger correction on row mismatch
+            pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id, gold_sql=ex.gold_sql)
+    except Exception as e:
+        pred_sql = f"-- ERROR: {e}"
+
+    # Metrics
+    gold_norm = normalize_sql(ex.gold_sql)
+    pred_norm = normalize_sql(pred_sql)
+    em = int(gold_norm == pred_norm)
+
+    # Validity & Exec
+    valid_ok, exec_ok = 0, 0
+    if db_path.exists():
+        ok_pred, pred_rows = try_exec_sqlite(db_path, pred_sql)
+        valid_ok = int(ok_pred)
+        if ok_pred:
+            ok_gold, gold_rows = try_exec_sqlite(db_path, ex.gold_sql)
+            if ok_gold:
+                exec_ok = int(rows_to_canonical(pred_rows) == rows_to_canonical(gold_rows))
+
+    row_data = [mode, split_name, idx, ex.db_id, ex.question, ex.gold_sql, pred_sql, em, valid_ok, exec_ok]
+    return (idx, pred_sql, em, valid_ok, exec_ok, row_data)
+
+
 def benchmark(
     model_name: str,
     splits: List[str],
@@ -269,6 +338,7 @@ def benchmark(
     max_completion_tokens: Optional[int] = None,
     reasoning_effort: Optional[str] = None,
     verbose: bool = False,
+    parallel: int = 1,
 ) -> None:
     ensure_dir(out_dir)
     ensure_dir(DATA_DIR)
@@ -279,27 +349,6 @@ def benchmark(
         download_spider_zip_to(DATA_DIR)
 
     have_exec = DB_DIR.exists()
-
-    # Initialize model
-    if mode == "simple":
-        model = SQLGeneratorGraph(
-            model_name=model_name,
-            temperature=0.0,
-            max_completion_tokens=max_completion_tokens,
-            reasoning_effort=reasoning_effort,
-        )
-    elif mode == "sot":
-        model = SQLOfThoughtGraph(
-            model_name=model_name,
-            temperature=0.0,
-            max_attempts=max_corrections,
-            taxonomy_path=taxonomy_file,
-            max_completion_tokens=max_completion_tokens,
-            reasoning_effort=reasoning_effort,
-            verbose=bool(verbose),
-        )
-    else:
-        raise ValueError(f"Unknown --mode {mode}")
 
     # Load requested splits
     work = load_all_examples(splits=splits, limit=limit)
@@ -317,48 +366,62 @@ def benchmark(
             "em", "valid_sql", "exec_acc"
         ])
 
+        csv_lock = threading.Lock()
+
         for split_name, examples in work:
-            print(f"[info] Running split: {split_name} (n={len(examples)}) mode={mode}")
-            for i, ex in enumerate(tqdm(examples, desc=f"{split_name}")):
-                total += 1
-                db_path = DB_DIR / ex.db_id / f"{ex.db_id}.sqlite"
+            print(f"[info] Running split: {split_name} (n={len(examples)}) mode={mode} parallel={parallel}")
+            
+            if parallel <= 1:
+                # Sequential execution (original behavior)
+                model = _create_model(mode, model_name, max_corrections, taxonomy_file,
+                                      max_completion_tokens, reasoning_effort, verbose)
+                for i, ex in enumerate(tqdm(examples, desc=f"{split_name}")):
+                    total += 1
+                    idx, pred_sql, em, valid_ok, exec_ok, row_data = _process_example(
+                        ex, i, split_name, mode, model
+                    )
+                    em_hits += em
+                    valid_hits += valid_ok
+                    exec_hits += exec_ok
+                    writer.writerow(row_data)
+            else:
+                # Parallel execution
+                # Create a thread-local storage for models
+                thread_local = threading.local()
 
-                # Generate SQL via selected pipeline
-                try:
-                    if mode == "simple":
-                        pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id)
-                    else:
-                        # Pass gold_sql so SoT can trigger correction on row mismatch
-                        pred_sql = model.generate_sql_for_db(ex.question, str(db_path), ex.db_id, gold_sql=ex.gold_sql)
-                except Exception as e:
-                    pred_sql = f"-- ERROR: {e}"
+                def get_model():
+                    if not hasattr(thread_local, 'model'):
+                        thread_local.model = _create_model(
+                            mode, model_name, max_corrections, taxonomy_file,
+                            max_completion_tokens, reasoning_effort, verbose
+                        )
+                    return thread_local.model
 
-                # Metrics
-                gold_norm = normalize_sql(ex.gold_sql)
-                pred_norm = normalize_sql(pred_sql)
-                em = int(gold_norm == pred_norm)
-                em_hits += em
+                def process_with_model(args):
+                    i, ex = args
+                    model = get_model()
+                    return _process_example(ex, i, split_name, mode, model)
 
-                # Validity & Exec
-                valid_ok, exec_ok = 0, 0
-                if db_path.exists():
-                    ok_pred, pred_rows = try_exec_sqlite(db_path, pred_sql)
-                    valid_ok = int(ok_pred)
-                    if ok_pred:
-                        ok_gold, gold_rows = try_exec_sqlite(db_path, ex.gold_sql)
-                        if ok_gold:
-                            exec_ok = int(rows_to_canonical(pred_rows) == rows_to_canonical(gold_rows))
-                else:
-                    valid_ok = 0
-                    exec_ok = 0
-
-                valid_hits += valid_ok
-                exec_hits += exec_ok
-
-                writer.writerow([
-                    mode, split_name, i, ex.db_id, ex.question, ex.gold_sql, pred_sql,
-                    em, valid_ok, exec_ok
-                ])
+                with ThreadPoolExecutor(max_workers=parallel) as executor:
+                    futures = {executor.submit(process_with_model, (i, ex)): i 
+                               for i, ex in enumerate(examples)}
+                    
+                    results = []
+                    with tqdm(total=len(examples), desc=f"{split_name}") as pbar:
+                        for future in as_completed(futures):
+                            result = future.result()
+                            results.append(result)
+                            pbar.update(1)
+                    
+                    # Sort results by index to maintain order in CSV
+                    results.sort(key=lambda x: x[0])
+                    
+                    for idx, pred_sql, em, valid_ok, exec_ok, row_data in results:
+                        total += 1
+                        em_hits += em
+                        valid_hits += valid_ok
+                        exec_hits += exec_ok
+                        writer.writerow(row_data)
 
     # Summary
     print("\n===== Summary =====")
@@ -385,9 +448,7 @@ def main():
     parser.add_argument("--mode", type=str, default="simple", choices=["simple", "sot"],
                         help="Which pipeline to run: simple (one-shot) or sot (SQL-of-Thought).")
     parser.add_argument("--model", type=str, default=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                        help="OpenAI model name (default: OPENAI_MODEL or gpt-4.1-mini).")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="Random seed for reproducibility (default: 42)")
+                        help="Model name (default: OPENAI_MODEL or gpt-4.1-mini). Use 'anth:' prefix for Anthropic models (e.g., anth:claude-sonnet-4-5).")
     parser.add_argument("--max_corrections", type=int, default=2,
                         help="[sot only] Max correction attempts (default: 2).")
     parser.add_argument("--taxonomy_file", type=str, default="error_taxonomy.json",
@@ -403,15 +464,23 @@ def main():
                         choices=["spider", "spider-realistic", "spider-syn"],
                         help="Which splits to run (default: spider)")
     parser.add_argument("--output_dir", type=Path, default=HERE / "outputs", help="Where to write CSV results.")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="Number of examples to process in parallel (default: 1, sequential)")
     args = parser.parse_args()
 
-    # Seed everything for reproducibility
-    set_global_seed(args.seed)
+    # No global seeding by default; allow natural randomness.
 
-    # Early key check
-    if not os.getenv("OPENAI_API_KEY"):
-        print("ERROR: OPENAI_API_KEY environment variable is not set.")
-        sys.exit(1)
+    # Early key check based on model provider
+    is_anthropic = args.model.startswith("anth:")
+    if is_anthropic:
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            print("ERROR: ANTHROPIC_API_KEY environment variable is not set.")
+            print("       Required for Anthropic models (anth:* prefix).")
+            sys.exit(1)
+    else:
+        if not os.getenv("OPENAI_API_KEY"):
+            print("ERROR: OPENAI_API_KEY environment variable is not set.")
+            sys.exit(1)
 
     ensure_dir(args.output_dir)
     benchmark(
@@ -425,6 +494,7 @@ def main():
         max_completion_tokens=args.max_completion_tokens,
         reasoning_effort=args.reasoning_effort,
         verbose=bool(args.verbose),
+        parallel=args.parallel,
     )
 
 
